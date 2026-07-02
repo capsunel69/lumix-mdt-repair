@@ -30,18 +30,20 @@ The killer feature is `selftest`: before touching your broken file, the tool re-
 
 ```bash
 # 1. Prove the method works for your camera/settings (uses a healthy clip)
-mdt-repair selftest P1448719.MP4
+python3 mdt_repair.py selftest P1448719.MP4
 
 # 2. Repair (safe default: writes a new file, original .MDT untouched)
-mdt-repair repair P1448720.MDT P1448719.MP4
+python3 mdt_repair.py repair P1448720.MDT P1448719.MP4
 
 # Fast path for huge files: repair in place (seconds instead of copying
 # the whole file; fully reversible)
-mdt-repair repair P1448720.MDT P1448719.MP4 --in-place
+python3 mdt_repair.py repair P1448720.MDT P1448719.MP4 --in-place
 
 # Changed your mind? Restore the original .MDT byte-for-byte
-mdt-repair undo P1448720.MP4.mdt-recovery.json
+python3 mdt_repair.py undo P1448720.MP4.mdt-recovery.json
 ```
+
+Optionally, `pip install .` from the repo root installs an `mdt-repair` command that works the same way.
 
 The reference clip must come from the **same camera with the same settings** (resolution, frame rate, codec, audio format). The clip recorded immediately before or after the interrupted one is ideal.
 

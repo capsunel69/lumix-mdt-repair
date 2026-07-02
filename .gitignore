@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.scan-state.json
+*.mdt-recovery.json
+dist/
+build/
+*.egg-info/

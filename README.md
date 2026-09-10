@@ -72,3 +72,9 @@ ffmpeg -v error -i repaired.MP4 -f null -   # full decode check
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+
+## Example command
+
+python3 mdt_repair.py repair broken_file.MDT good_file.MP4

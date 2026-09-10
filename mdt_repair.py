@@ -7,8 +7,8 @@ card stops mid-recording, it leaves an .MDT file: the raw 'mdat' payload of
 an MP4 with no index ('moov'). The footage is intact but unplayable.
 
 This tool rebuilds the moov by scanning the interleaved stream:
-  * video samples are recovered by walking length-prefixed H.264 (AVCC) NAL
-    units -- each sample starts with an Access Unit Delimiter,
+  * video samples are recovered by walking length-prefixed H.264 (AVCC) or
+    HEVC (hvc1) NAL units -- each sample starts with an Access Unit Delimiter,
   * AAC audio frame boundaries are recovered by decoding the raw stream with
     libavcodec (same technique as untrunc), which reports bytes consumed
     per frame,
@@ -150,6 +150,15 @@ class Ref:
         # video timing
         vstbl = find(self.moov, *self.vtrak, path=["mdia", "minf", "stbl"])
         self.vstbl = vstbl
+        stsd = find(self.moov, vstbl[0], vstbl[1], ["stsd"])
+        codec = self.moov[stsd[0] + 12:stsd[0] + 16]
+        if codec in (b"hvc1", b"hev1"):
+            self.hevc = True
+        elif codec in (b"avc1", b"avc3"):
+            self.hevc = False
+        else:
+            raise SystemExit(f"error: unsupported video codec {codec!r} "
+                             "(need avc1/H.264 or hvc1/HEVC)")
         r = find(self.moov, vstbl[0], vstbl[1], ["stts"])
         n = struct.unpack_from(">I", self.moov, r[0] + 4)[0]
         deltas = {struct.unpack_from(">II", self.moov, r[0] + 8 + 8 * i)[1]
@@ -228,7 +237,8 @@ class Ref:
 
     def summary(self):
         fps = self.vtimescale / self.vdelta
-        s = [f"video: {fps:.3f} fps (delta {self.vdelta}@{self.vtimescale})"]
+        codec = "HEVC" if self.hevc else "H.264"
+        s = [f"video: {codec} {fps:.3f} fps (delta {self.vdelta}@{self.vtimescale})"]
         if self.ctts_period:
             s.append(f"B-frame ctts period: {self.ctts_period}")
         if self.atrak:
@@ -249,10 +259,23 @@ class AudioUnavailable(Exception):
 
 
 def _load_libav():
-    cand_codec = ["libavcodec.so.58", "libavcodec.so.57",
-                  "libavcodec.58.dylib", "libavcodec.57.dylib"]
-    cand_util = ["libavutil.so.56", "libavutil.so.55",
-                 "libavutil.56.dylib", "libavutil.55.dylib"]
+    extra = [
+        "/opt/homebrew/opt/ffmpeg@4/lib",
+        "/usr/local/opt/ffmpeg@4/lib",
+        "/opt/homebrew/lib",
+        "/usr/local/lib",
+    ]
+    cand_codec = []
+    cand_util = []
+    for d in extra:
+        cand_codec += [os.path.join(d, n) for n in
+                       ("libavcodec.58.dylib", "libavcodec.57.dylib")]
+        cand_util += [os.path.join(d, n) for n in
+                      ("libavutil.56.dylib", "libavutil.55.dylib")]
+    cand_codec += ["libavcodec.so.58", "libavcodec.so.57",
+                   "libavcodec.58.dylib", "libavcodec.57.dylib"]
+    cand_util += ["libavutil.so.56", "libavutil.so.55",
+                  "libavutil.56.dylib", "libavutil.55.dylib"]
     for lib in (ctypes.util.find_library("avcodec"),):
         if lib:
             cand_codec.append(lib)
@@ -371,10 +394,16 @@ class AAC:
 # --------------------------------------------------------------------------
 
 VALID_NAL = frozenset(range(1, 13))
-AUD_PAT = b"\x00\x00\x00\x02\x09"   # 4-byte length 2 + AUD NAL header
+AUD_PAT_H264 = b"\x00\x00\x00\x02\x09"   # 4-byte length 2 + AUD NAL header
+AUD_PAT_HEVC = b"\x00\x00\x00\x03\x46"   # length 3 + HEVC AUD (type 35)
+HEVC_IRAP = frozenset(range(16, 22))
 
 
-def walk_video_chunk(f, off, file_end):
+def _aud_pat(hevc):
+    return AUD_PAT_HEVC if hevc else AUD_PAT_H264
+
+
+def walk_video_chunk(f, off, file_end, hevc=False):
     """Walk AVCC NALs from off. Sample boundaries at AUD NALs.
     Returns (sample_sizes, idr_flags, end_offset)."""
     samples, idrs = [], []
@@ -382,23 +411,29 @@ def walk_video_chunk(f, off, file_end):
     cur_idr = False
     started = False
     pos = off
-    while pos + 5 <= file_end:
+    need = 6 if hevc else 5
+    min_l = 2 if hevc else 1
+    aud = 35 if hevc else 9
+    while pos + need <= file_end:
         f.seek(pos)
-        hdr = f.read(5)
+        hdr = f.read(need)
+        if len(hdr) < need:
+            break
         L = struct.unpack_from(">I", hdr)[0]
         b0 = hdr[4]
-        typ = b0 & 0x1F
-        if (L < 1 or L > 8_000_000 or (b0 & 0x80)
-                or typ not in VALID_NAL or pos + 4 + L > file_end):
+        typ = (b0 >> 1) & 0x3F if hevc else (b0 & 0x1F)
+        bad_typ = typ > 40 if hevc else typ not in VALID_NAL
+        if (L < min_l or L > 8_000_000 or (b0 & 0x80)
+                or bad_typ or pos + 4 + L > file_end):
             break
-        if typ == 9:
+        if typ == aud:
             if started:
                 samples.append(cur)
                 idrs.append(cur_idr)
             started, cur, cur_idr = True, 0, False
         elif not started:
             break  # chunks must start with an AUD
-        if typ == 5:
+        if (typ in HEVC_IRAP) if hevc else (typ == 5):
             cur_idr = True
         cur += 4 + L
         pos += 4 + L
@@ -408,23 +443,57 @@ def walk_video_chunk(f, off, file_end):
     return samples, idrs, off + sum(samples)
 
 
-def find_next_video(f, off, file_end, window=8 * 1024 * 1024):
+def find_next_video(f, off, file_end, window=8 * 1024 * 1024, hevc=False):
     f.seek(off)
     data = f.read(min(window, file_end - off))
-    i = data.find(AUD_PAT)
+    i = data.find(_aud_pat(hevc))
     return off + i if i != -1 else None
 
 
-def detect_stream_start(f, file_end):
+def _mdat_box_off(f, file_end):
+    """Offset of the first mdat box header in a leading-box prefix, else None."""
+    pos = 0
+    limit = min(file_end, 4 * 1024 * 1024)
+    while pos + 8 <= limit:
+        f.seek(pos)
+        h = f.read(16)
+        if len(h) < 8:
+            return None
+        size, typ = struct.unpack_from(">I4s", h, 0)
+        hdr = 8
+        if size == 1:
+            if len(h) < 16:
+                return None
+            size = struct.unpack_from(">Q", h, 8)[0]
+            hdr = 16
+        elif size == 0:
+            size = file_end - pos
+        if typ == b"mdat":
+            return pos
+        if size < hdr:
+            return None
+        pos += size
+    return None
+
+
+def detect_stream_start(f, file_end, hevc=False):
     """The mdt usually begins with an unfinalized mdat header (8 bytes) plus
-    8 scratch bytes. Find where NAL data actually starts."""
-    for off in (16, 8, 0):
-        s, _, _ = walk_video_chunk(f, off, min(file_end, off + 4_000_000))
+    8 scratch bytes. Some cameras prefix free/skip boxes; find the NALs."""
+    candidates = [16, 8, 0]
+    mdat = _mdat_box_off(f, file_end)
+    if mdat:
+        candidates = [mdat + 16, mdat + 8, mdat] + candidates
+    probe = min(file_end, 4_000_000)
+    for off in candidates:
+        if off >= file_end:
+            continue
+        s, _, _ = walk_video_chunk(f, off, min(file_end, off + probe), hevc)
         if s:
             return off
-    nx = find_next_video(f, 0, min(file_end, 1 << 20))
+    nx = find_next_video(f, 0, min(file_end, 2 << 20), hevc=hevc)
     if nx is None:
-        raise SystemExit("error: no H.264 stream found near start of file")
+        kind = "HEVC" if hevc else "H.264"
+        raise SystemExit(f"error: no {kind} stream found near start of file")
     return nx
 
 
@@ -442,7 +511,8 @@ def scan(mdt_path, ref, state_path, video_only=False, budget=None, quiet=False):
     if state_path and os.path.exists(state_path):
         st = json.load(open(state_path))
     else:
-        st = {"pos": detect_stream_start(f, fe), "vchunks": [], "achunks": [],
+        st = {"pos": detect_stream_start(f, fe, hevc=ref.hevc),
+              "vchunks": [], "achunks": [],
               "anomalies": [], "done": False}
 
     t0 = time.time()
@@ -459,10 +529,10 @@ def scan(mdt_path, ref, state_path, video_only=False, budget=None, quiet=False):
     while pos < fe and not st["done"]:
         if budget and time.time() - t0 > budget:
             break
-        samples, idrs, vend = walk_video_chunk(f, pos, fe)
+        samples, idrs, vend = walk_video_chunk(f, pos, fe, hevc=ref.hevc)
         if not samples:
             st["anomalies"].append(["video_resync", pos])
-            nx = find_next_video(f, pos + 1, fe)
+            nx = find_next_video(f, pos + 1, fe, hevc=ref.hevc)
             if nx is None:
                 st["done"] = True
                 break
@@ -470,7 +540,7 @@ def scan(mdt_path, ref, state_path, video_only=False, budget=None, quiet=False):
             continue
         st["vchunks"].append([pos, samples, [int(b) for b in idrs]])
 
-        nxt = find_next_video(f, vend, fe)
+        nxt = find_next_video(f, vend, fe, hevc=ref.hevc)
         # audio region [vend, nxt); a false AUD match inside audio data makes
         # decode fail -- extend the region past the phantom match and retry.
         sizes = None
@@ -483,7 +553,7 @@ def scan(mdt_path, ref, state_path, video_only=False, budget=None, quiet=False):
                 sizes = aac.frame_sizes(f.read(blob_len))
                 if sizes is not None:
                     break
-                nxt2 = find_next_video(f, nxt + 1, fe)
+                nxt2 = find_next_video(f, nxt + 1, fe, hevc=ref.hevc)
                 if nxt2 is None:
                     break
                 nxt = nxt2
@@ -676,7 +746,7 @@ def cmd_selftest(args):
     si = ok = 0
     nchk = min(len(voffs), 50)
     for ci in range(nchk):
-        samples, _, end = walk_video_chunk(f, voffs[ci], fe)
+        samples, _, end = walk_video_chunk(f, voffs[ci], fe, hevc=ref.hevc)
         if samples == vsz[si:si + len(samples)]:
             ok += 1
         si += len(samples)
@@ -760,7 +830,7 @@ def cmd_repair(args):
     hdr = struct.pack(">I", 1) + b"mdat" + struct.pack(">Q", size)
 
     if args.in_place:
-        stream_start = detect_stream_start(open(mdt, "rb"), size)
+        stream_start = detect_stream_start(open(mdt, "rb"), size, hevc=ref.hevc)
         if stream_start < 16:
             raise SystemExit("error: no 16-byte header slack; in-place repair "
                              "impossible -- rerun without --in-place")
